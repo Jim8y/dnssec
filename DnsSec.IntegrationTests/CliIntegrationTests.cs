@@ -106,6 +106,16 @@ public class CliIntegrationTests
         Assert.Contains("self-validating stub via 1.1.1.1", result.StandardOutput);
     }
 
+    [Fact]
+    public void DomainKeyTxtRecord_IsReturned()
+    {
+        var result = RunCli("google._domainkey.vandenhooff.name", "--type", "TXT", "--server", "1.1.1.1");
+
+        Assert.Equal(0, result.ExitCode);
+        const string expectedSnippet = "v=DKIM1\\; k=rsa\\; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCl2Qrp5KF1uJnQSO0YuwInVPISQRrUciXtg/5hnQl6ed+UmYvWreLyuiyaiSd9X9Zu+aZQoeKm67HCxSMpC6G2ar0NludsXW69QdfzUpB5I6fzaLW8rl/RyeGkiQ3D66kvadK1wlNfUI7Dt9WtnUs8AFz/15xvODzgTMFJDiAcAwIDAQAB";
+        Assert.Contains(expectedSnippet, result.StandardOutput);
+    }
+
     private static CliResult RunCli(params string[] args)
     {
         using var stdout = new StringWriter();
