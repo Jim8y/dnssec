@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text.Json;
 using Xunit;
 
 namespace DnsSec.IntegrationTests;
@@ -32,6 +33,42 @@ public class CliIntegrationTests
         Assert.Equal(0, result.ExitCode);
         Assert.Contains("self-validating stub via https://cloudflare-dns.com/dns-query", result.StandardOutput);
         Assert.Contains("Overall DNSSEC validation: Signed", result.StandardOutput);
+    }
+
+    [Fact]
+    public void DkimLookup_ExtractsPublicKey()
+    {
+        var result = RunCli("--dkim-domain", "whitehouse.gov", "--dkim-selector", "selector1", "--server", "https://cloudflare-dns.com/dns-query");
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Contains("DKIM lookup:", result.StandardOutput);
+        Assert.Contains("Public key (base64):", result.StandardOutput);
+        Assert.Contains("MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A", result.StandardOutput);
+    }
+
+    [Fact]
+    public void DkimLookup_JsonIncludesPublicKey()
+    {
+        var result = RunCli("--dkim-domain", "whitehouse.gov", "--dkim-selector", "selector1", "--server", "https://cloudflare-dns.com/dns-query", "--format", "json");
+
+        Assert.Equal(0, result.ExitCode);
+        using var document = JsonDocument.Parse(result.StandardOutput);
+        Assert.True(document.RootElement.TryGetProperty("dkim", out var dkim), "dkim property missing");
+        Assert.Equal("selector1", dkim.GetProperty("selector").GetString());
+        Assert.Equal("whitehouse.gov", dkim.GetProperty("domain").GetString());
+        string? publicKey = dkim.GetProperty("publicKeyBase64").GetString();
+        Assert.False(string.IsNullOrWhiteSpace(publicKey));
+        Assert.Contains("MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A", publicKey);
+    }
+
+    [Fact]
+    public void DkimLookup_RequireSignedFailsForUnsignedZone()
+    {
+        var result = RunCli("--dkim-domain", "whitehouse.gov", "--dkim-selector", "selector1", "--server", "https://cloudflare-dns.com/dns-query", "--require-signed");
+
+        Assert.Equal(8, result.ExitCode);
+        Assert.Contains("DNSSEC signatures required (--require-signed);", result.StandardError);
+        Assert.Contains("Overall DNSSEC validation: Unsigned", result.StandardError + result.StandardOutput);
     }
 
     [Fact]

@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Reflection;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -12,6 +13,13 @@ public static class DnsSecCli
 {
     private const int DefaultStubTimeoutMs = 10_000;
     private const int DefaultRecursiveTimeoutMs = 15_000;
+    private static readonly string[] TxtSegmentPropertyCandidates = new[]
+    {
+        "TextDataArray",
+        "TextDataList",
+        "TextParts",
+        "TextSegments"
+    };
 
     public static int Run(string[] args, TextWriter stdout, TextWriter stderr)
     {
@@ -64,7 +72,20 @@ public static class DnsSecCli
 
             var aggregateResult = AggregateValidation(outcomes);
 
-            var rendered = RenderResults(options, outcomes);
+            var dkimInfo = options.IsDkimLookup ? TryExtractDkimInfo(options, outcomes) : null;
+            if (options.IsDkimLookup && dkimInfo != null)
+            {
+                if (dkimInfo.TxtSegments.Count == 0)
+                {
+                    stderr.WriteLine("No TXT records found for the DKIM selector.");
+                }
+                else if (string.IsNullOrWhiteSpace(dkimInfo.PublicKeyBase64))
+                {
+                    stderr.WriteLine("TXT record did not contain a DKIM p= public key value.");
+                }
+            }
+
+            var rendered = RenderResults(options, outcomes, dkimInfo);
             if (options.AppendOutput && string.IsNullOrWhiteSpace(options.OutputPath))
             {
                 stderr.WriteLine("--append requires --output to be specified.");
@@ -143,12 +164,12 @@ public static class DnsSecCli
         }
     }
 
-    private static string RenderResults(CliOptions options, IReadOnlyList<QueryOutcome> outcomes) =>
+    private static string RenderResults(CliOptions options, IReadOnlyList<QueryOutcome> outcomes, DkimLookupSummary? dkimInfo) =>
     options.Format == OutputFormat.Json
-        ? RenderJsonResults(options, outcomes)
-        : RenderTextResults(options, outcomes);
+        ? RenderJsonResults(options, outcomes, dkimInfo)
+        : RenderTextResults(options, outcomes, dkimInfo);
 
-    private static string RenderTextResults(CliOptions options, IReadOnlyList<QueryOutcome> outcomes)
+    private static string RenderTextResults(CliOptions options, IReadOnlyList<QueryOutcome> outcomes, DkimLookupSummary? dkimInfo)
 {
     var sb = new StringBuilder();
     var recordClass = FormatRecordClass(options.RecordClass);
@@ -197,10 +218,32 @@ public static class DnsSecCli
         }
     }
 
+    if (options.IsDkimLookup)
+    {
+        sb.AppendLine();
+        sb.AppendLine("DKIM lookup:");
+        sb.AppendLine($"  Selector: {options.DkimSelector}");
+        sb.AppendLine($"  Domain  : {options.DkimDomain}");
+        sb.AppendLine($"  Record  : {options.Domain}");
+        if (dkimInfo != null && dkimInfo.TxtSegments.Count > 0)
+        {
+            sb.AppendLine("  TXT data:");
+            foreach (var segment in dkimInfo.TxtSegments)
+            {
+                sb.AppendLine($"    {segment}");
+            }
+        }
+        else
+        {
+            sb.AppendLine("  TXT data: <none>");
+        }
+        sb.AppendLine($"  Public key (base64): {dkimInfo?.PublicKeyBase64 ?? "<not found>"}");
+    }
+
     return sb.ToString();
 }
 
-    private static string RenderJsonResults(CliOptions options, IReadOnlyList<QueryOutcome> outcomes)
+    private static string RenderJsonResults(CliOptions options, IReadOnlyList<QueryOutcome> outcomes, DkimLookupSummary? dkimInfo)
 {
     var aggregate = AggregateValidation(outcomes);
     var resolverMode = options.DohServers.Count > 0
@@ -243,7 +286,15 @@ public static class DnsSecCli
             validationResult = o.Result.ValidationResult.ToString(),
             description = DescribeValidation(o.Result.ValidationResult),
             records = o.Result.Records.Select(CreateRecordDto).ToArray()
-        }).ToArray()
+        }).ToArray(),
+        dkim = options.IsDkimLookup ? new
+        {
+            selector = options.DkimSelector,
+            domain = options.DkimDomain,
+            recordName = options.Domain,
+            txtSegments = dkimInfo?.TxtSegments ?? Array.Empty<string>(),
+            publicKeyBase64 = dkimInfo?.PublicKeyBase64
+        } : null
     };
 
     return JsonSerializer.Serialize(payload, new JsonSerializerOptions
@@ -315,6 +366,86 @@ public static class DnsSecCli
         },
         _ => new { text = record.ToString() }
     };
+
+    private static DkimLookupSummary? TryExtractDkimInfo(CliOptions options, IReadOnlyList<QueryOutcome> outcomes)
+{
+    if (!options.IsDkimLookup)
+    {
+        return null;
+    }
+
+    string selector = options.DkimSelector ?? string.Empty;
+    string domain = options.DkimDomain ?? string.Empty;
+    string recordName = options.Domain;
+
+    var txtRecords = outcomes
+        .SelectMany(o => o.Result.Records.OfType<TxtRecord>())
+        .ToList();
+
+    if (txtRecords.Count == 0)
+    {
+        return new DkimLookupSummary(selector, domain, recordName, Array.Empty<string>(), null);
+    }
+
+    foreach (var txt in txtRecords)
+    {
+        var segments = GetTxtSegments(txt);
+        var publicKey = ExtractDkimPublicKey(segments);
+        if (!string.IsNullOrWhiteSpace(publicKey))
+        {
+            return new DkimLookupSummary(selector, domain, recordName, segments, publicKey);
+        }
+    }
+
+    var fallbackSegments = GetTxtSegments(txtRecords[0]);
+    return new DkimLookupSummary(selector, domain, recordName, fallbackSegments, null);
+}
+
+    private static IReadOnlyList<string> GetTxtSegments(TxtRecord record)
+{
+    foreach (var propertyName in TxtSegmentPropertyCandidates)
+    {
+        var property = record.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        if (property?.GetValue(record) is IEnumerable<string> enumerable)
+        {
+            var segments = enumerable.Where(s => !string.IsNullOrWhiteSpace(s))
+                .Select(s => s.Trim())
+                .ToArray();
+            if (segments.Length > 0)
+            {
+                return segments;
+            }
+        }
+    }
+
+    if (!string.IsNullOrEmpty(record.TextData))
+    {
+        return new[] { record.TextData };
+    }
+
+    var fallback = record.ToString();
+    return string.IsNullOrEmpty(fallback) ? Array.Empty<string>() : new[] { fallback };
+}
+
+    private static string? ExtractDkimPublicKey(IReadOnlyList<string> segments)
+{
+    if (segments.Count == 0)
+    {
+        return null;
+    }
+
+    var combined = string.Concat(segments).Replace("\"", string.Empty);
+    foreach (var part in combined.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+    {
+        if (part.StartsWith("p=", StringComparison.OrdinalIgnoreCase))
+        {
+            var value = part[2..].Trim();
+            return value.Length > 0 ? value : null;
+        }
+    }
+
+    return null;
+}
 
     private static QueryOutcome ResolveRecord(IDnsSecResolver resolver, string domain, RecordType recordType, RecordClass recordClass)
 {
@@ -396,6 +527,7 @@ public static class DnsSecCli
 }
 
 internal sealed record QueryOutcome(RecordType RecordType, DnsSecResult<DnsRecordBase> Result);
+internal sealed record DkimLookupSummary(string Selector, string Domain, string RecordName, IReadOnlyList<string> TxtSegments, string? PublicKeyBase64);
 
 internal sealed class CliOptions
 {
@@ -404,6 +536,9 @@ internal sealed class CliOptions
     public List<IPAddress> Servers { get; } = new();
     public List<Uri> DohServers { get; } = new();
     public bool HasStubResolver => Servers.Count > 0 || DohServers.Count > 0;
+    public string? DkimSelector { get; private set; }
+    public string? DkimDomain { get; private set; }
+    public bool IsDkimLookup => !string.IsNullOrWhiteSpace(DkimSelector) && !string.IsNullOrWhiteSpace(DkimDomain);
     public int? TimeoutMs { get; private set; }
     public int? OverallTimeoutMs { get; private set; }
     public OutputFormat Format { get; private set; } = OutputFormat.Text;
@@ -480,6 +615,24 @@ internal sealed class CliOptions
                             return false;
                         }
                         options.RecordClass = recordClass;
+                        break;
+
+                    case "--dkim-selector":
+                        if (string.IsNullOrWhiteSpace(value))
+                        {
+                            error = "--dkim-selector requires a selector value.";
+                            return false;
+                        }
+                        options.DkimSelector = value.Trim().TrimEnd('.');
+                        break;
+
+                    case "--dkim-domain":
+                        if (string.IsNullOrWhiteSpace(value))
+                        {
+                            error = "--dkim-domain requires a domain value.";
+                            return false;
+                        }
+                        options.DkimDomain = value.Trim().TrimEnd('.');
                         break;
 
                     case "--server":
@@ -579,19 +732,65 @@ internal sealed class CliOptions
                     return false;
                 }
 
-                options.Domain = arg;
+                options.Domain = arg.Trim();
             }
         }
 
-        if (string.IsNullOrEmpty(options.Domain))
+        if (options.DkimSelector is null ^ options.DkimDomain is null)
         {
-            error = "A domain name must be provided.";
+            error = "--dkim-selector and --dkim-domain must be provided together.";
             return false;
         }
 
-        if (options.RecordTypes.Count == 0)
+        if (options.IsDkimLookup)
         {
-            options.RecordTypes.Add(RecordType.A);
+            string derivedRecord = $"{options.DkimSelector}._domainkey.{options.DkimDomain}".Trim('.');
+            string normalizedDerived = derivedRecord.ToLowerInvariant();
+            if (string.IsNullOrEmpty(options.Domain))
+            {
+                options.Domain = normalizedDerived;
+            }
+            else
+            {
+                string normalizedDomain = options.Domain.TrimEnd('.').ToLowerInvariant();
+                if (!normalizedDomain.Equals(normalizedDerived, StringComparison.Ordinal))
+                {
+                    error = $"Domain argument '{options.Domain}' does not match DKIM selector/domain '{derivedRecord}'.";
+                    return false;
+                }
+
+                options.Domain = normalizedDomain;
+            }
+
+            if (options.RecordTypes.Count == 0)
+            {
+                options.RecordTypes.Add(RecordType.Txt);
+            }
+            else if (!options.RecordTypes.Contains(RecordType.Txt))
+            {
+                error = "DKIM lookups require TXT records. Include TXT in --type.";
+                return false;
+            }
+        }
+        else
+        {
+            if (string.IsNullOrEmpty(options.Domain))
+            {
+                error = "A domain name must be provided.";
+                return false;
+            }
+
+            options.Domain = options.Domain.Trim().TrimEnd('.');
+            if (string.IsNullOrEmpty(options.Domain))
+            {
+                error = "A domain name must be provided.";
+                return false;
+            }
+
+            if (options.RecordTypes.Count == 0)
+            {
+                options.RecordTypes.Add(RecordType.A);
+            }
         }
 
         return true;
@@ -606,6 +805,10 @@ internal sealed class CliOptions
         output.WriteLine("  --class, -c <CLASS>      DNS record class (default: IN / INet).");
         output.WriteLine("  --server, -s <ENDPOINT>[,ENDPOINT]");
         output.WriteLine("                          Upstream validating resolver(s) to query. Accepts IP addresses or https:// DNS-over-HTTPS endpoints.");
+        output.WriteLine("      --dkim-selector <NAME>");
+        output.WriteLine("                          DKIM selector to query (requires --dkim-domain).");
+        output.WriteLine("      --dkim-domain <DOMAIN>");
+        output.WriteLine("                          DKIM base domain. Record queried is <selector>._domainkey.<domain>.");
         output.WriteLine("  --format, -f <FORMAT>    Output format: text (default) or json.");
         output.WriteLine("  --output, -o <PATH>      Write the rendered output to the specified file.");
         output.WriteLine("      --append             Append to the output file instead of overwriting.");
