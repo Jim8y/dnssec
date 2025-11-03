@@ -29,7 +29,12 @@ public static class DnsSecCli
         }
 
         IDnsSecResolver resolver;
-        if (options.Servers.Count > 0)
+        if (options.DohServers.Count > 0)
+        {
+            int queryTimeout = options.TimeoutMs ?? DefaultStubTimeoutMs;
+            resolver = new SelfValidatingInternalDnsSecStubResolver(options.DohServers[0], queryTimeout);
+        }
+        else if (options.Servers.Count > 0)
         {
             int queryTimeout = options.TimeoutMs ?? DefaultStubTimeoutMs;
             resolver = new SelfValidatingInternalDnsSecStubResolver(options.Servers, queryTimeout);
@@ -116,6 +121,7 @@ public static class DnsSecCli
         catch (DnsSecValidationException ex)
         {
             stderr.WriteLine($"DNSSEC validation failed: {ex.Message}");
+            WriteValidationFailureHint(stderr, options);
             return 2;
         }
         catch (Exception ex)
@@ -148,7 +154,11 @@ public static class DnsSecCli
     var recordClass = FormatRecordClass(options.RecordClass);
     sb.AppendLine($"Query: {options.Domain} {recordClass}");
     sb.AppendLine($"Requested types: {string.Join(", ", outcomes.Select(o => FormatRecordType(o.RecordType)).Distinct())}");
-    if (options.Servers.Count > 0)
+    if (options.DohServers.Count > 0)
+    {
+        sb.AppendLine($"Resolver: self-validating stub via {options.DohServers[0]} (DNS-over-HTTPS; timeout: {DescribeTimeout(options.TimeoutMs ?? DefaultStubTimeoutMs)})");
+    }
+    else if (options.Servers.Count > 0)
     {
         var list = string.Join(", ", options.Servers.Select(s => s.ToString()));
         sb.AppendLine($"Resolver: self-validating stub via {list} (timeout: {DescribeTimeout(options.TimeoutMs ?? DefaultStubTimeoutMs)})");
@@ -193,6 +203,19 @@ public static class DnsSecCli
     private static string RenderJsonResults(CliOptions options, IReadOnlyList<QueryOutcome> outcomes)
 {
     var aggregate = AggregateValidation(outcomes);
+    var resolverMode = options.DohServers.Count > 0
+        ? "stub-doh"
+        : options.Servers.Count > 0
+            ? "stub"
+            : "recursive";
+    var resolverServers = options.DohServers.Count > 0
+        ? options.DohServers.Select(u => u.ToString()).ToArray()
+        : options.Servers.Select(s => s.ToString()).ToArray();
+    var resolverTransport = options.DohServers.Count > 0
+        ? "https"
+        : options.Servers.Count > 0
+            ? "udp/tcp"
+            : "recursive";
     var payload = new
     {
         query = new
@@ -203,9 +226,10 @@ public static class DnsSecCli
         },
         resolver = new
         {
-            mode = options.Servers.Count > 0 ? "stub" : "recursive",
-            servers = options.Servers.Select(s => s.ToString()).ToArray(),
-            timeoutMs = options.TimeoutMs ?? (options.Servers.Count > 0 ? DefaultStubTimeoutMs : DefaultRecursiveTimeoutMs),
+            mode = resolverMode,
+            transport = resolverTransport,
+            servers = resolverServers,
+            timeoutMs = options.TimeoutMs ?? (options.HasStubResolver ? DefaultStubTimeoutMs : DefaultRecursiveTimeoutMs),
             overallTimeoutMs = options.OverallTimeoutMs
         },
         dnssec = new
@@ -326,6 +350,23 @@ public static class DnsSecCli
     return sawUnsigned ? DnsSecValidationResult.Unsigned : DnsSecValidationResult.Signed;
 }
 
+    private static void WriteValidationFailureHint(TextWriter stderr, CliOptions options)
+    {
+        if (options.DohServers.Count > 0)
+        {
+            return;
+        }
+
+        if (options.Servers.Count > 0)
+        {
+            stderr.WriteLine("Hint: Upstream resolvers sometimes strip DNSSEC data. If that persists, try a DNS-over-HTTPS endpoint, e.g. --server https://cloudflare-dns.com/dns-query");
+        }
+        else
+        {
+            stderr.WriteLine("Hint: Some networks block DNSSEC. Re-run with a DNS-over-HTTPS resolver, e.g. --server https://cloudflare-dns.com/dns-query");
+        }
+    }
+
     private static string DescribeTimeout(int? timeoutMs)
 {
     return timeoutMs is int ms ? $"{ms} ms" : "library default";
@@ -361,6 +402,8 @@ internal sealed class CliOptions
     public string Domain { get; private set; } = string.Empty;
     public RecordClass RecordClass { get; private set; } = RecordClass.INet;
     public List<IPAddress> Servers { get; } = new();
+    public List<Uri> DohServers { get; } = new();
+    public bool HasStubResolver => Servers.Count > 0 || DohServers.Count > 0;
     public int? TimeoutMs { get; private set; }
     public int? OverallTimeoutMs { get; private set; }
     public OutputFormat Format { get; private set; } = OutputFormat.Text;
@@ -442,20 +485,45 @@ internal sealed class CliOptions
                     case "--server":
                     case "--resolver":
                     case "-s":
-                        int initialCount = options.Servers.Count;
+                        int resolverCountBefore = options.Servers.Count + options.DohServers.Count;
                         foreach (string entry in value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
                         {
-                            if (!IPAddress.TryParse(entry, out var address))
+                            if (IPAddress.TryParse(entry, out var address))
                             {
-                                error = $"Invalid server IP address '{entry}'.";
-                                return false;
+                                if (options.DohServers.Count > 0)
+                                {
+                                    error = "Cannot mix IP servers with DNS-over-HTTPS endpoints in --server.";
+                                    return false;
+                                }
+                                options.Servers.Add(address);
+                                continue;
                             }
-                            options.Servers.Add(address);
+
+                            if (Uri.TryCreate(entry, UriKind.Absolute, out var uri) && uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
+                            {
+                                if (options.Servers.Count > 0)
+                                {
+                                    error = "Cannot mix DNS-over-HTTPS endpoints with IP servers in --server.";
+                                    return false;
+                                }
+
+                                if (options.DohServers.Count > 0)
+                                {
+                                    error = "Only one DNS-over-HTTPS endpoint is supported with --server.";
+                                    return false;
+                                }
+
+                                options.DohServers.Add(uri);
+                                continue;
+                            }
+
+                            error = $"Invalid server value '{entry}'. Provide an IP address or an https:// DNS-over-HTTPS endpoint.";
+                            return false;
                         }
 
-                        if (options.Servers.Count == initialCount)
+                        if (options.Servers.Count + options.DohServers.Count == resolverCountBefore)
                         {
-                            error = "At least one server address must be provided after --server.";
+                            error = "At least one server endpoint must be provided after --server.";
                             return false;
                         }
                         break;
@@ -536,7 +604,8 @@ internal sealed class CliOptions
         output.WriteLine("Options:");
         output.WriteLine("  --type, -t <TYPE>        DNS record type(s) to query (default: A). Accepts comma-separated values.");
         output.WriteLine("  --class, -c <CLASS>      DNS record class (default: IN / INet).");
-        output.WriteLine("  --server, -s <IP>[,IP]   Upstream validating resolver(s) to query. Supports multiple comma-separated servers.");
+        output.WriteLine("  --server, -s <ENDPOINT>[,ENDPOINT]");
+        output.WriteLine("                          Upstream validating resolver(s) to query. Accepts IP addresses or https:// DNS-over-HTTPS endpoints.");
         output.WriteLine("  --format, -f <FORMAT>    Output format: text (default) or json.");
         output.WriteLine("  --output, -o <PATH>      Write the rendered output to the specified file.");
         output.WriteLine("      --append             Append to the output file instead of overwriting.");

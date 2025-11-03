@@ -21,7 +21,7 @@ The double dash (`--`) separates `dotnet run` arguments from the tool's own argu
 | ------ | ----------- |
 | `--type`, `-t` | DNS record type(s) to query (default: `A`). Accepts comma-separated values or repeated flags. |
 | `--class`, `-c` | DNS record class. Accepts `IN`, `CH`, `HS`, or any value from `ARSoft.Tools.Net.Dns.RecordClass` (default: `IN`). |
-| `--server`, `-s` | One or more comma-separated DNS server IPs to query instead of performing full recursion. The responses are still validated with DNSSEC. |
+| `--server`, `-s` | One or more comma-separated endpoints to query instead of performing full recursion. Accepts DNS server IPs or `https://` DNS-over-HTTPS resolvers. Responses are still validated with DNSSEC. |
 | `--format`, `-f` | Output format. Accepted values: `text` (default) or `json`. |
 | `--output`, `-o` | Write CLI output to the specified file in addition to stdout. |
 | `--append` | Append to the output file instead of overwriting (requires `--output`). |
@@ -43,6 +43,12 @@ Validate an `AAAA` record using Cloudflare's resolver with a custom timeout:
 
 ```bash
 dotnet run -- example.com --type AAAA --server 1.1.1.1 --timeout 3000
+```
+
+Bypass DNS tampering by using DNS-over-HTTPS:
+
+```bash
+dotnet run -- example.com --server https://cloudflare-dns.com/dns-query --type A
 ```
 
 Query both `A` and `AAAA` records in a single run:
@@ -99,7 +105,7 @@ The suite verifies signed vs. unsigned domains, file output/quiet combinations, 
 
 ## How It Works
 
-- The application uses `SelfValidatingInternalDnsSecStubResolver` when `--server` is provided, otherwise it falls back to `DnsSecRecursiveDnsResolver` with the default root trust anchors.
+- The application uses `SelfValidatingInternalDnsSecStubResolver` when `--server` is provided (supporting both IP and DNS-over-HTTPS endpoints), otherwise it falls back to `DnsSecRecursiveDnsResolver` with the default root trust anchors.
 - `ResolveSecure<T>()` is used to retrieve records along with their DNSSEC validation status.
 - Exit codes: `0` for successful validation or unsigned-but-validated responses, `2` for DNSSEC validation failures, and `99` for unexpected errors.
 - Additional exit codes: `5` when writing to an output file fails, `6` when `--append` is used without `--output`, `7` when `--quiet` is used without `--output`.
@@ -109,5 +115,6 @@ The suite verifies signed vs. unsigned domains, file output/quiet combinations, 
 
 - When DNSSEC validation fails, the tool prints the failure reason and returns a non-zero exit code.
 - DNS zones without DNSSEC return `Unsigned` and the tool will still exit with `0`, indicating the response validated according to DNSSEC opt-out rules.
+- Some networks strip DNSSEC records from UDP responses. If you see bogus validation failures, rerun with a DNS-over-HTTPS resolver via `--server https://...`.
 - The `--overall-timeout` limit is evaluated after each record-type query finishes. A single long-running lookup may exceed the limit before cancellation can be observed.
 - Default per-query timeouts: 10 seconds for stub resolver mode, 15 seconds for recursive mode when `--timeout` is not provided.

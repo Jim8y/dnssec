@@ -25,6 +25,16 @@ public class CliIntegrationTests
     }
 
     [Fact]
+    public void DohResolver_SignedDomain_ReturnsSigned()
+    {
+        var result = RunCli("example.com", "--type", "DS", "--server", "https://cloudflare-dns.com/dns-query");
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Contains("self-validating stub via https://cloudflare-dns.com/dns-query", result.StandardOutput);
+        Assert.Contains("Overall DNSSEC validation: Signed", result.StandardOutput);
+    }
+
+    [Fact]
     public void QuietModeWithOutput_WritesFileOnly()
     {
         string tempFile = Path.Combine(Path.GetTempPath(), $"dnssec-ut-{Guid.NewGuid():N}.log");
